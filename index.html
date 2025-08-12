@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>RAG Logic Tester</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; background-color: #f8f9fa; }
+    .container { max-width: 900px; margin: 20px auto; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+    h1, h2 { color: #333; }
+    textarea, input { width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+    textarea { height: 200px; resize: vertical; }
+    button { padding: 10px 15px; border: none; border-radius: 4px; background-color: #007bff; color: white; cursor: pointer; }
+    button:disabled { background-color: #aaa; }
+    #results, #log { margin-top: 20px; padding: 15px; border: 1px solid #eee; border-radius: 4px; background-color: #fdfdfd; max-height: 400px; overflow-y: auto; }
+    #log { font-family: monospace; font-size: 13px; color: #333; white-space: pre-wrap; }
+    .result-item { border-bottom: 1px solid #eee; padding: 10px 0; }
+    .result-item:last-child { border-bottom: none; }
+    .similarity { font-weight: bold; color: #28a745; }
+  </style>
+
+  <!-- ESM loader: prefer WebGPU, fall back to WASM -->
+  <script src="./assets/transformers/dist/ort.min.js"></script>
+<script type="module">
+  import { pipeline, env } from './assets/js/transformers.js';
+
+  // Configure ORT WASM distribution path (use CDN due to missing local assets/MIME issues)
+  // Also configure CPU (ONNX Runtime Web) to be a robust fallback when WebGPU is unavailable.
+  env.useBrowserCache = true;
+
+  // Force local models only (offline) and point to the local models base path
+  env.localModelPath = new URL('models/', document.baseURI).href;
+  env.allowRemoteModels = false;
+  env.allowLocalModels = true;
+  // Force CPU/WASM on all browsers to maximize offline compatibility (especially Firefox)
+  env.backends = ['wasm'];
+
+  // Configure ORT WASM paths compatibly across transformers.js versions
+  const wasmDist = new URL('assets/transformers/dist/', document.baseURI).href;
+  try {
+    if (env && env.ORT && env.ORT.wasm) {
+      env.ORT.wasm.wasmPaths = wasmDist;
+      env.ORT.wasm.proxy = false;
+      env.ORT.wasm.simd = true;
+      env.ORT.wasm.numThreads =
+        Math.min(2, (navigator && navigator.hardwareConcurrency) ? navigator.hardwareConcurrency : 2);
+    } else if (env && env.backends && env.backends.onnx && env.backends.onnx.wasm) {
+      env.backends.onnx.wasm.wasmPaths = wasmDist;
+      env.backends.onnx.wasm.proxy = false;
+      env.backends.onnx.wasm.simd = true;
+      env.backends.onnx.wasm.numThreads =
+        Math.min(2, (navigator && navigator.hardwareConcurrency) ? navigator.hardwareConcurrency : 2);
+    }
+  } catch (e) {
+    console.warn('[Embeddings] ORT WASM config skipped:', e);
+  }
+
+  // Helper: pick backend. You can override via ?backend=webgpu|wasm
+  const urlBackend = new URLSearchParams(location.search).get('backend');
+  const supportsWebGPU = !!navigator.gpu;
+  const isFirefox = navigator.userAgent && /firefox/i.test(navigator.userAgent);
+  // Force CPU/WASM by default; enable WebGPU only if user explicitly requests ?backend=webgpu
+  const preferWebGPU = (urlBackend === 'webgpu') && supportsWebGPU && !isFirefox;
+
+  async function makePipe(backend, dtypeOverride) { // Add dtypeOverride parameter
+    if (backend === 'webgpu') {
+      // Use WebGPU with requested dtype (fp16 default, fp32 fallback when needed)
+      return pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
+        device: 'webgpu',
+        dtype: dtypeOverride || 'fp16'
+      });
+    }
+    // For CPU/WASM, force device: 'wasm' for Firefox reliability
+    return pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', { device: 'wasm' });
+  }
+
+  // Expose a lazy global with auto-fallback
+  window.getEmbeddingPipeline = async () => {
+    if (window.__embedPipe) return window.__embedPipe;
+
+    let backendToTry = preferWebGPU ? 'webgpu' : 'wasm';
+    let dtypeToTry = 'fp16'; // Initial WebGPU dtype
+
+    if (backendToTry === 'webgpu') {
+      try {
+        console.log(`[Embeddings] Trying WebGPU (${dtypeToTry})…`);
+        window.__embedPipe = await makePipe('webgpu', dtypeToTry);
+        window.__embedBackend = 'webgpu';
+      } catch (err) {
+        console.warn(`[Embeddings] WebGPU (${dtypeToTry}) init failed.`, err);
+        if (err.message && err.message.includes('does not support fp16')) {
+          // If fp16 specifically failed, try fp32
+          dtypeToTry = 'fp32';
+          try {
+            console.log(`[Embeddings] Trying WebGPU (${dtypeToTry})…`);
+            window.__embedPipe = await makePipe('webgpu', dtypeToTry);
+            window.__embedBackend = 'webgpu';
+          } catch (err2) {
+            // If fp32 also fails, fall back to WASM
+            console.warn(`[Embeddings] WebGPU (${dtypeToTry}) also failed, falling back to WASM.`, err2);
+            backendToTry = 'wasm';
+          }
+        } else {
+          // For any other WebGPU error, fall back to WASM
+          console.warn('[Embeddings] WebGPU init failed (non-dtype error), falling back to WASM.', err);
+          backendToTry = 'wasm';
+        }
+      }
+    }
+
+    // If WebGPU failed or was not preferred, try CPU/WASM explicitly
+    if (!window.__embedPipe && backendToTry === 'wasm') {
+      try {
+        console.log(`[Embeddings] Trying CPU/WASM…`);
+        window.__embedPipe = await makePipe('wasm');
+        window.__embedBackend = 'wasm';
+      } catch (e) {
+        console.error('[Embeddings] CPU/WASM initialization failed.', e);
+      }
+    }
+
+    if (!window.__embedPipe) {
+      throw new Error('Failed to initialize any embedding pipeline backend.');
+    }
+
+    console.log(`[Embeddings] Ready on ${window.__embedBackend.toUpperCase()}.`);
+    return window.__embedPipe;
+  };
+
+  // Optional: quick backend switcher for debugging
+  window.setEmbeddingBackend = async (backend /* 'webgpu' | 'wasm' */) => {
+    window.__embedPipe = null;
+    window.__embedBackend = null;
+    return window.getEmbeddingPipeline(backend);
+  };
+
+</script>
+
+</head>
+<body>
+  <div class="container">
+    <h1>RAG Logic Tester</h1>
+    <p>This tool demonstrates the core logic of a Retrieval-Augmented Generation (RAG) system using client-side embeddings and IndexedDB.</p>
+
+    <h2>1. Indexing</h2>
+    <p>Paste a large block of text below and click "Index Text". The text will be split into chunks, embedded, and stored in IndexedDB.</p>
+    <textarea id="text-to-index" placeholder="Paste your long text here..."></textarea>
+    <button id="index-btn">Index Text</button>
+
+    <h2>2. Searching</h2>
+    <p>Once the text is indexed, type a query below to retrieve the most relevant chunks.</p>
+    <input type="text" id="search-query" placeholder="Enter your search query...">
+    <button id="search-btn" disabled>Search</button>
+
+    <h2>Results</h2>
+    <div id="results">No results yet.</div>
+
+    <h2>Log</h2>
+    <div id="log"></div>
+  </div>
+
+  <script>
+    // <!--- Edited by AI [start] --->
+    // Function to load sample text
+    async function loadSampleText() {
+      try {
+        const response = await fetch('sample-text.txt');
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const sampleText = await response.text();
+        textToIndexEl.value = sampleText;
+        log('Sample text loaded successfully.');
+      } catch (error) {
+        log('Error loading sample text: ' + error.message);
+      }
+    }
+
+    // Load sample text on page load
+    window.addEventListener('DOMContentLoaded', loadSampleText);
+    // <!--- Edited by AI [end] --->
+
+    // ---------- DOM helpers ----------
+    const textToIndexEl = document.getElementById('text-to-index');
+    const indexBtn = document.getElementById('index-btn');
+    const searchQueryEl = document.getElementById('search-query');
+    const searchBtn = document.getElementById('search-btn');
+    const resultsEl = document.getElementById('results');
+    const logEl = document.getElementById('log');
+
+    function log(message) {
+      console.log(message);
+      logEl.innerHTML += message + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function disableAI(reason) {
+      indexBtn.style.display = 'none';
+      searchBtn.style.display = 'none';
+      resultsEl.innerHTML = 'AI engine unavailable. ' + reason;
+      log('AI Chart Unable to work, please contact engineer to check. Reason: ' + reason);
+    }
+
+    // ---------- RAG & IndexedDB ----------
+    let featureExtractor = null;     // lazy-initialized pipeline
+    const DB_NAME = 'ragTesterDB';
+    const DB_VERSION = 1;
+    let db = null;
+
+    async function initDB() {
+      return new Promise((resolve, reject) => {
+        log('Initializing IndexedDB...');
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+        request.onerror = () => reject("IndexedDB error: " + request.errorCode);
+        request.onsuccess = () => { db = request.result; log('IndexedDB initialized successfully.'); resolve(db); };
+        request.onupgradeneeded = (event) => {
+          log('Upgrading IndexedDB schema...');
+          const store = event.target.result.createObjectStore('chunks', { keyPath: 'id', autoIncrement: true });
+          store.createIndex('embedding', 'embedding', { multiEntry: false });
+          store.createIndex('reportId', 'reportId', { unique: false });
+        };
+      });
+    }
+
+    async function ensureFeatureExtractor() {
+      if (featureExtractor) return featureExtractor;
+      if (typeof window.getEmbeddingPipeline !== 'function') {
+        throw new Error('Transformers ESM loader not initialized (window.getEmbeddingPipeline missing)');
+      }
+      log('Initializing feature-extraction pipeline...');
+      featureExtractor = await window.getEmbeddingPipeline();
+      log('Feature-extraction pipeline ready.');
+      return featureExtractor;
+    }
+
+    async function generateEmbedding(text) {
+      try {
+        const pipe = await ensureFeatureExtractor();
+        const input = (text == null ? '' : String(text)).slice(0, 10000);
+        const out = await pipe(input, { pooling: 'mean', normalize: true });
+        const vec = Array.from((out && out.data) ? out.data : (out || []));
+        if (!vec.length) throw new Error('Empty embedding vector');
+        return vec;
+      } catch (e) {
+        log('Embeddings error: ' + (e && e.message ? e.message : e));
+        throw e;
+      }
+    }
+
+    function chunkText(text, chunkSize = 200, overlap = 40) {
+      log(`Chunking text... (Chunk size: ${chunkSize}, Overlap: ${overlap})`);
+      const chunks = [];
+      const words = text.split(/\s+/);
+      let currentChunk = [];
+      for (let i = 0; i < words.length; i++) {
+        currentChunk.push(words[i]);
+        if (currentChunk.length >= chunkSize) {
+          chunks.push(currentChunk.join(' '));
+          currentChunk = currentChunk.slice(currentChunk.length - overlap);
+        }
+      }
+      if (currentChunk.length > 0) chunks.push(currentChunk.join(' '));
+      log(`Created ${chunks.length} chunks.`);
+      return chunks;
+    }
+
+    async function clearChunksForReport(reportId) {
+      if (!db) await initDB();
+      return new Promise((resolve, reject) => {
+        try {
+          log(`Clearing old chunks for reportId: ${reportId}`);
+          const tx = db.transaction(['chunks'], 'readwrite');
+          const store = tx.objectStore('chunks');
+          const idx = store.index('reportId');
+          const range = IDBKeyRange.only(reportId);
+          const cursorReq = idx.openCursor(range);
+          cursorReq.onsuccess = (e) => {
+            const cursor = e.target.result;
+            if (cursor) { store.delete(cursor.primaryKey); cursor.continue(); }
+          };
+          cursorReq.onerror = () => reject(cursorReq.error);
+          tx.oncomplete = () => { log('Old chunks cleared.'); resolve(); };
+          tx.onerror = () => reject(tx.error || new Error('clearChunksForReport transaction failed'));
+        } catch (err) { reject(err); }
+      });
+    }
+
+    async function saveChunks(reportId, chunks) {
+      if (!db) await initDB();
+      const items = [];
+      log('Generating embeddings for all chunks...');
+      for (const chunk of chunks) {
+        const embedding = await generateEmbedding(chunk);
+        items.push({ reportId, content: chunk, embedding: Array.from(embedding) });
+      }
+      log('Embeddings generated. Saving to IndexedDB...');
+      return new Promise((resolve, reject) => {
+        try {
+          const tx = db.transaction(['chunks'], 'readwrite');
+          const store = tx.objectStore('chunks');
+          for (const item of items) store.add(item);
+          tx.oncomplete = () => { log('All chunks saved to IndexedDB.'); resolve(); };
+          tx.onerror = () => reject(tx.error || new Error('saveChunks transaction failed'));
+        } catch (err) { reject(err); }
+      });
+    }
+
+    function cosineSimilarity(vecA, vecB) {
+      const a = Array.isArray(vecA) ? vecA : Array.from(vecA || []);
+      const b = Array.isArray(vecB) ? vecB : Array.from(vecB || []);
+      const n = Math.min(a.length, b.length);
+      if (!n) return 0;
+      let dot = 0, normA = 0, normB = 0;
+      for (let i = 0; i < n; i++) {
+        const va = Number(a[i]) || 0;
+        const vb = Number(b[i]) || 0;
+        dot += va * vb;
+        normA += va * va;
+        normB += vb * vb;
+      }
+      if (normA === 0 || normB === 0) return 0;
+      return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+    }
+
+    async function findSimilarChunks(queryEmbedding, reportId, topN = 3) {
+      if (!db) await initDB();
+      log(`Finding similar chunks for report: ${reportId}`);
+      const transaction = db.transaction(['chunks'], 'readonly');
+      const store = transaction.objectStore('chunks');
+      const allChunks = await new Promise((resolve, reject) => {
+        const request = store.getAll();
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+
+      const reportChunks = allChunks.filter(chunk => chunk.reportId === reportId);
+      log(`Found ${reportChunks.length} chunks for this report.`);
+      reportChunks.forEach(chunk => {
+        chunk.similarity = cosineSimilarity(queryEmbedding, chunk.embedding);
+      });
+
+      reportChunks.sort((a, b) => b.similarity - a.similarity);
+      const topChunks = reportChunks.slice(0, topN);
+      log(`Top ${topN} similar chunks found.`);
+      return topChunks;
+    }
+
+    // ---------- UI events ----------
+    indexBtn.addEventListener('click', async () => {
+      if (typeof window.getEmbeddingPipeline !== 'function') return disableAI('Transformers ESM failed to load.');
+      const text = textToIndexEl.value.trim();
+      if (!text) { alert('Please paste some text to index.'); return; }
+      indexBtn.disabled = true;
+      indexBtn.textContent = 'Indexing...';
+      logEl.innerHTML = '';
+      try {
+        const reportId = 'test-report';
+        const chunks = chunkText(text);
+        await clearChunksForReport(reportId);
+        await saveChunks(reportId, chunks);
+        log('--- Indexing Complete ---');
+        searchBtn.disabled = false;
+      } catch (error) {
+        log('Error during indexing: ' + (error && error.message ? error.message : error));
+      } finally {
+        indexBtn.disabled = false;
+        indexBtn.textContent = 'Index Text';
+      }
+    });
+
+    searchBtn.addEventListener('click', async () => {
+      if (typeof window.getEmbeddingPipeline !== 'function') return disableAI('Transformers ESM failed to load.');
+      const query = searchQueryEl.value.trim();
+      if (!query) { alert('Please enter a search query.'); return; }
+      searchBtn.disabled = true;
+      searchBtn.textContent = 'Searching...';
+      resultsEl.innerHTML = 'Searching...';
+      try {
+        log('--- New Search ---');
+        log(`Query: "${query}"`);
+        const reportId = 'test-report';
+        const queryEmbedding = await generateEmbedding(query);
+        const similarChunks = await findSimilarChunks(queryEmbedding, reportId, 3);
+
+        if (similarChunks.length === 0) {
+          resultsEl.innerHTML = 'No relevant chunks found.';
+        } else {
+          resultsEl.innerHTML = '';
+          similarChunks.forEach(chunk => {
+            const item = document.createElement('div');
+            item.className = 'result-item';
+            item.innerHTML = `
+              <p><strong>Similarity: <span class="similarity">${chunk.similarity.toFixed(4)}</span></strong></p>
+              <p>${chunk.content}</p>
+            `;
+            resultsEl.appendChild(item);
+          });
+        }
+        log('--- Search Complete ---');
+      } catch (error) {
+        log('Error during search: ' + (error && error.message ? error.message : error));
+        resultsEl.innerHTML = 'An error occurred during the search.';
+      } finally {
+        searchBtn.disabled = false;
+        searchBtn.textContent = 'Search';
+      }
+    });
+
+    // Initialize DB on load
+    initDB().catch(err => log('Initial DB load failed: ' + (err && err.message ? err.message : err)));
+  </script>
+</body>
+</html>
